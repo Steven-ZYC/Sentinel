@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (c) 2026 Steven Zhang -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 180" role="img" aria-labelledby="title desc">
+  <title id="title">Sentinel</title>
+  <desc id="desc">A blue shield with a watchful beacon, followed by the Sentinel wordmark.</desc>
+  <defs>
+    <linearGradient id="shield" x1="38" y1="18" x2="144" y2="157" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#184a78"/>
+      <stop offset="1" stop-color="#0b203b"/>
+    </linearGradient>
+  </defs>
+  <path d="M90 14 158 41v51c0 35-24 62-68 76C46 154 22 127 22 92V41z" fill="url(#shield)"/>
+  <path d="M90 31 143 52v40c0 26-17 47-53 61-36-14-53-35-53-61V52z" fill="none" stroke="#7dd3fc" stroke-width="5" stroke-linejoin="round"/>
+  <path d="M48 92c11-17 25-25 42-25s31 8 42 25c-11 17-25 25-42 25S59 109 48 92Z" fill="none" stroke="#b9ecff" stroke-width="5" stroke-linejoin="round"/>
+  <circle cx="90" cy="92" r="10" fill="#25c7c9"/>
+  <path d="M90 48v-9M90 145v-9" stroke="#25c7c9" stroke-width="5" stroke-linecap="round"/>
+  <text x="192" y="103" fill="#0b203b" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif" font-size="72" font-weight="700" letter-spacing="7">SENTINEL</text>
+  <text x="198" y="137" fill="#47718d" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif" font-size="18" font-weight="600" letter-spacing="4">SAFE EDGE GATEWAY</text>
+</svg>

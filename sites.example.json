@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "sites": [
+    {
+      "name": "app",
+      "type": "proxy",
+      "domain": "app.example.com",
+      "certificate": "/etc/sentinel/tls/app.example.com/fullchain.pem",
+      "private_key": "/etc/sentinel/tls/app.example.com/privkey.pem",
+      "upstream": {
+        "address": "127.0.0.1",
+        "port": 10443,
+        "scheme": "http"
+      },
+      "security": {
+        "content_security_policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' https:; script-src 'self' https:; connect-src 'self' https: wss:; upgrade-insecure-requests",
+        "permissions_policy": "accelerometer=(), autoplay=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+      }
+    },
+    {
+      "name": "portal",
+      "type": "proxy",
+      "domain": "portal.example.com",
+      "certificate": "/etc/sentinel/tls/portal.example.com/fullchain.pem",
+      "private_key": "/etc/sentinel/tls/portal.example.com/privkey.pem",
+      "upstream": {
+        "address": "127.0.0.1",
+        "port": 10444,
+        "scheme": "http"
+      },
+      "client_max_body_size": "30m",
+      "security": {
+        "content_security_policy": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' https:; script-src 'self' https:; connect-src 'self' https: wss:; upgrade-insecure-requests",
+        "permissions_policy": "accelerometer=(), autoplay=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+      }
+    },
+    {
+      "name": "legacy-redirect",
+      "type": "redirect",
+      "domain": "legacy.example.com",
+      "certificate": "/etc/sentinel/tls/legacy.example.com/fullchain.pem",
+      "private_key": "/etc/sentinel/tls/legacy.example.com/privkey.pem",
+      "redirect_to": "https://portal.example.com"
+    }
+  ]
+}
