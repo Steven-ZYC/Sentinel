@@ -23,11 +23,13 @@ class RenderSitesTests(unittest.TestCase):
         self.key = self.root / "privkey.pem"
         self.cert.write_text("certificate", encoding="utf-8")
         self.key.write_text("private-key", encoding="utf-8")
+        self.key.chmod(0o600)
         self.env = self.root / ".env"
         self.env.write_text(
             "\n".join(
                 (
                     "PUBLIC_LISTEN_ADDR=203.0.113.10",
+                    "EDGE_MODE=direct",
                     f"TLS_MOUNT_ROOT={self.root}",
                     f"DEFAULT_TLS_CERT_PATH={self.cert}",
                     f"DEFAULT_TLS_KEY_PATH={self.key}",
@@ -37,7 +39,8 @@ class RenderSitesTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.sites = self.root / "sites.json"
-        self.output = self.root / "generated"
+        self.generated = self.root / "generated"
+        self.output = self.generated / "current"
         self.write_manifest()
 
     def tearDown(self) -> None:
@@ -79,7 +82,7 @@ class RenderSitesTests(unittest.TestCase):
                 "--sites",
                 str(self.sites),
                 "--output",
-                str(self.output),
+                str(self.generated),
                 *arguments,
             ],
             text=True,
@@ -90,7 +93,7 @@ class RenderSitesTests(unittest.TestCase):
     def test_renders_proxy_redirect_and_default_servers(self) -> None:
         result = self.render("--check-certificates")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("default_server", (self.output / "00-default.conf").read_text(encoding="utf-8"))
+        self.assertIn("default_server", (self.output / "02-default.conf").read_text(encoding="utf-8"))
         proxy = (self.output / "10-app.conf").read_text(encoding="utf-8")
         self.assertIn("server 127.0.0.1:10443", proxy)
         self.assertIn("ssl_certificate \"/etc/sentinel/tls/fullchain.pem\"", proxy)
@@ -98,6 +101,8 @@ class RenderSitesTests(unittest.TestCase):
         redirect = (self.output / "11-legacy.conf").read_text(encoding="utf-8")
         self.assertIn("return 308 https://app.example.com$request_uri", redirect)
         self.assertEqual((self.output / ".healthcheck-host").read_text(encoding="utf-8"), "app.example.com\n")
+        for path in self.output.iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644, path)
         checked = self.render("--check", "--check-certificates")
         self.assertEqual(checked.returncode, 0, checked.stderr)
 

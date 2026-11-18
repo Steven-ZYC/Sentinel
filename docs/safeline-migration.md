@@ -41,7 +41,7 @@ curl -I -H 'Host: app.example.com' http://127.0.0.1:10443/
 
 ## 2. 将 SafeLine 内部监听限制到回环
 
-先检查脚本只识别到一个站点，再应用：
+`check` 对不安全监听会返回非零；核对控制台端口后执行 `apply`：
 
 ```bash
 UPSTREAM_PORT=10443 ./scripts/safeline-listener.sh check
@@ -49,9 +49,7 @@ sudo UPSTREAM_PORT=10443 ./scripts/safeline-listener.sh apply
 ss -ltn 'sport = :10443'
 ```
 
-脚本执行顺序固定：创建带 UTC 时间戳的备份、仅把
-`listen 0.0.0.0:10443 default_server` 改成 `listen 127.0.0.1:10443 default_server`、运行
-`nginx -t`，最后 reload。它遇到零个或多个候选站点会中止，不会猜测。
+脚本先备份，将该端口全部 IPv4 listener 改为 `127.0.0.1`、IPv6 listener 改为 `::1`，运行 `nginx -t`、reload，再确认所有实际 socket 均为回环。失败恢复原文件并重载；遇到零个或多个候选站点会中止。
 
 SafeLine 后续在控制台重新发布该站点时可能重建 `IF_*` 文件。每次 SafeLine 更新或
 站点变更后都要执行：
@@ -70,10 +68,11 @@ cp .env.example .env
 cp sites.example.json sites.json
 editor .env
 editor sites.json
-./scripts/render-sites.py
-./scripts/preflight.sh
+sudo python3 scripts/harden_deployment.py tls
+sudo python3 scripts/harden_deployment.py realip
+sudo ./scripts/preflight.sh
 sudo docker compose pull
-sudo docker compose up -d
+sudo ./scripts/deploy-proxy.sh
 sudo docker compose ps
 sudo docker compose logs --tail=100 proxy
 ```
@@ -81,9 +80,7 @@ sudo docker compose logs --tail=100 proxy
 `sites.json` 为每个业务域名声明独立的 `127.0.0.1:<SafeLine listener>` 上游、证书和
 安全策略；多个业务域名仍共用 Sentinel 的公网 80/443。确认 `ss -ltn` 显示 Sentinel
 占用 80/443，且每一个 SafeLine 业务 listener 均只占用回环地址（例如
-`127.0.0.1:10443`）。Cloudflare SSL/TLS 模式应为 Full (strict)，DNS 记录应保持代理
-状态；不要把 Cloudflare Origin CA 证书暴露给公网直连客户端。
-在 Cloudflare Dashboard 的 SSL/TLS -> Edge Certificates 中将 Minimum TLS Version 设为 TLS 1.2，并确认 TLS 1.3 已启用。公网当前实测仍接受 TLS 1.0；仅修改 Sentinel 源站不能修复 Cloudflare 边缘协议。
+`127.0.0.1:10443`）。普通 DNS 直连选择 direct 并使用公共 CA 证书；Cloudflare 橙云选择 cloudflare 和 Full (strict)，不可将 Origin CA 证书用于公网直连。在 Cloudflare 边缘设置 Minimum TLS Version 为 TLS 1.2，并确保 HSTS 不为 max-age=0。详见[通用服务器部署](general-server-deployment.md)。
 
 ## 4. 回滚
 
@@ -93,20 +90,19 @@ sudo docker compose logs --tail=100 proxy
 sudo docker compose down
 ```
 
-在 SafeLine 控制台把站点端口从 10443 改回 443 并发布。若控制台无法使用，可用
-`apply` 输出的备份路径回滚生成文件：
+在 SafeLine 控制台把站点端口从 10443 改回 443 并发布。listener 脚本的 `restore` 用于恢复安全的回环配置，不会接受公网业务监听；整体架构回滚应由控制台发布。安全配置的备份路径示例：
 
 ```bash
 sudo SAFELINE_SITE_FILE=/data/safeline/resources/nginx/sites-enabled/IF_backend_1 \
   ./scripts/safeline-listener.sh restore \
-  /data/safeline/backups/sentinel/<UTC时间>/IF_backend_1
+  /data/safeline/backups/sentinel/listeners/backup-<随机值>/IF_backend_1
 ```
 
 最后验证：
 
 ```bash
 sudo docker exec safeline-tengine nginx -t
-curl -kI --resolve app.example.com:443:127.0.0.1 https://app.example.com/
+curl -I --resolve app.example.com:443:127.0.0.1 https://app.example.com/
 ss -ltn 'sport = :443'
 ```
 
@@ -115,16 +111,23 @@ ss -ltn 'sport = :443'
 1. 记录升级前后 `IMAGE_TAG` 和镜像摘要。
 1. 在维护窗口执行；升级会重启 SafeLine 并造成短暂流量中断。
 2. 记录升级前版本、编排文件和镜像摘要：`grep IMAGE_TAG /data/safeline/.env`、`sudo docker compose images --digests`。
-3. 在 `/data/safeline` 执行官方在线升级：
+3. 从官方 HTTPS 地址下载管理脚本；不跳过 TLS 验证，不把远程内容直接交给 root shell。审核并记录固定 SHA-256（由审核后的变更记录提供），再执行：
 
 ```bash
 cd /data/safeline
-sudo bash -c "$(curl -fsSLk https://waf-ce.chaitin.cn/release/latest/manager.sh)"
+upgrade_dir=$(mktemp -d /tmp/safeline-upgrade.XXXXXX)
+curl --fail --show-error --location --proto '=https' --proto-redir '=https' \
+  https://waf-ce.chaitin.cn/release/latest/manager.sh -o "$upgrade_dir/manager.sh"
+# 阅读脚本；APPROVED_SHA256 必须来自已审核的固定版本记录，而不是盲目信任本次下载。
+less "$upgrade_dir/manager.sh"
+printf '%s  %s\n' "$APPROVED_SHA256" "$upgrade_dir/manager.sh" | sha256sum --check
+# 仅在前一步校验成功时执行：
+sudo bash "$upgrade_dir/manager.sh"
 ```
 
 4. SafeLine >= 9.2.3 会在 `.env` 新增 `MGT_PROXY`。Sentinel 当前不代理 9443 管理控制台，因此保持 `MGT_PROXY=0`；只有以后把管理控制台也置于代理后，才按实际可信代理层数调整。
 5. 在 SafeLine 控制台确认业务站点仍为 `10443/HTTP`；重新发布后执行 `sudo UPSTREAM_PORT=10443 ./scripts/safeline-listener.sh apply`，恢复 `127.0.0.1` 绑定。
-6. 执行 `./scripts/render-sites.py`、`./scripts/preflight.sh`、`sudo docker compose up -d` 和 `./scripts/verify.sh https://app.example.com`。每个其他业务域名也应独立验证。
+6. 执行 `sudo ./scripts/harden-deployment.sh`（已使用 Tailscale 时加 `--tailscale`）和 `./scripts/verify.sh https://app.example.com`。每个其他业务域名也应独立验证。
 7. 重新跑 Acunetix 完整扫描，不沿用升级前结论。
 8. 可选清理旧镜像：`sudo docker image prune --filter="label=maintainer=SafeLine-CE"`；先确认没有回滚依赖，失败时手工核对后清理。
 

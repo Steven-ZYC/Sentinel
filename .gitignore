@@ -1,7 +1,11 @@
 .env
 sites.json
-nginx/generated/*.conf
-nginx/generated/.healthcheck-host
+sites.json.*
+docs/security-remediation-2026-10-02.md
+nginx/generated/*
+!nginx/generated/.gitkeep
+.env.*
+!.env.example
 backups/
 secrets/
 .cloudflared/

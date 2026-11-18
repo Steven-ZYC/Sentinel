@@ -20,7 +20,7 @@ shop.example.org    ─┘                   -> 127.0.0.1:10444 (SafeLine) ─> 
 
 ## 添加业务站点
 
-1. 在 Cloudflare 创建橙云 DNS 记录，确认该 hostname 的 Origin 证书和私钥文件已在服务器上可读。
+1. 在所选 DNS 服务商创建 A/AAAA 记录，按 direct/cloudflare/trusted-proxy 选择入口模式；确认该 hostname 的适用证书和私钥已安全部署。
 2. 在 SafeLine 控制台创建站点：HTTP listener 使用未占用端口，例如 `10446`，应用上游填写回环或私网地址。
 3. 发布后收口 SafeLine listener：
 
@@ -52,14 +52,13 @@ shop.example.org    ─┘                   -> 127.0.0.1:10444 (SafeLine) ─> 
 5. 生成、验证并更新：
 
    ```bash
-   ./scripts/render-sites.py
-   ./scripts/preflight.sh
-   sudo docker compose up -d
+   sudo ./scripts/preflight.sh
+   sudo ./scripts/deploy-proxy.sh
    ./scripts/verify.sh https://new.example.com
    ```
 
 ## 更新、删除与回滚
 
-修改清单后必须重跑渲染器；预检会拒绝过期的 `nginx/generated/` 文件。删除站点时，先在 Cloudflare 与 SafeLine 中下线该域名，再从清单删除并重新渲染，避免遗留一个可被错误 Host 命中的内部 listener。
+修改清单后通过发布脚本验证完整候选、原子切换版本、显式重载并核对运行摘要；预检不会改变线上版本。删除站点时，先在对应 DNS/代理服务与 SafeLine 中下线该域名，再从清单删除并发布。
 
-SafeLine listener 脚本每次 `apply` 都会在 `/data/safeline/backups/sentinel/` 保存原站点文件。Sentinel 配置回滚则恢复之前审核过的 `sites.json` 与 `.env`，运行渲染器并执行 `sudo docker compose up -d`。若需要释放 `80/443` 回到旧架构，停止 Sentinel 后再在 SafeLine 控制台恢复对应 listener。
+SafeLine listener 脚本每次 `apply` 都会在 `/data/safeline/backups/sentinel/listeners/` 保存原文件。Sentinel 发布失败会自动恢复前一版本与镜像；手动回滚恢复审核过的清单与环境，再执行 `sudo ./scripts/deploy-proxy.sh`。若要回到旧架构，停止 Sentinel 后在 SafeLine 控制台恢复监听。

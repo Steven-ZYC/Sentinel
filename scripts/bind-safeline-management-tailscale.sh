@@ -11,8 +11,10 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 SAFELINE_DIR=${SAFELINE_DIR:-/data/safeline}
+PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SAFELINE_ENV="$SAFELINE_DIR/.env"
 MANAGEMENT_PORT=${MANAGEMENT_PORT:-9443}
+[[ $MANAGEMENT_PORT == 9443 ]] || { echo 'error: only the documented management port 9443 is supported' >&2; exit 1; }
 MANAGEMENT_URL=${MANAGEMENT_URL:-}
 ROLLBACK_UNIT=safeline-management-tailscale-rollback
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -23,9 +25,11 @@ CHANGED=0
 wait_for_url() {
     local url=$1
     local attempt
+    local -a tls_args=()
+    [[ $url == "https://127.0.0.1:$MANAGEMENT_PORT/"* ]] && tls_args=(--insecure)
 
     for attempt in {1..45}; do
-        if curl --fail --silent --show-error --insecure \
+        if curl --fail --silent --show-error "${tls_args[@]}" \
             --connect-timeout 5 --max-time 10 "$url" >/dev/null 2>&1; then
             return 0
         fi
@@ -56,8 +60,7 @@ TAILNET_HOST=$(tailscale serve status 2>/dev/null | sed -n 's|^https://\([^ ]*\)
 }
 
 SERVE_CONFIG=$(tailscale serve status --json 2>/dev/null)
-if ! grep -q '"443"' <<<"$SERVE_CONFIG" || \
-   ! grep -q "https+insecure://localhost:$MANAGEMENT_PORT" <<<"$SERVE_CONFIG"; then
+if ! printf '%s' "$SERVE_CONFIG" | python3 "$PROJECT_DIR/scripts/security_checks.py" serve; then
     echo "error: Tailscale HTTPS Serve is not forwarding to localhost:$MANAGEMENT_PORT" >&2
     echo "configure it with: sudo tailscale serve --bg https+insecure://localhost:$MANAGEMENT_PORT" >&2
     exit 1
@@ -97,16 +100,7 @@ sed -i -E "s|^MGT_PORT=.*$|MGT_PORT=127.0.0.1:$MANAGEMENT_PORT|" "$SAFELINE_ENV"
 wait_for_url "https://127.0.0.1:$MANAGEMENT_PORT/api/open/health"
 
 echo "[3/5] verifying public bind is gone"
-if ss -H -ltn "sport = :$MANAGEMENT_PORT" | awk '{print $4}' | \
-    grep -Eq "^(0\\.0\\.0\\.0|\[::\]):$MANAGEMENT_PORT$"; then
-    echo "error: management port is still publicly bound" >&2
-    false
-fi
-if ! ss -H -ltn "sport = :$MANAGEMENT_PORT" | awk '{print $4}' | \
-    grep -qx "127.0.0.1:$MANAGEMENT_PORT"; then
-    echo "error: management port is not bound to loopback" >&2
-    false
-fi
+python3 "$PROJECT_DIR/scripts/security_checks.py" management-tailnet
 
 echo "[4/5] verifying local Tailscale Serve configuration"
 if ! tailscale serve status --json 2>/dev/null | \

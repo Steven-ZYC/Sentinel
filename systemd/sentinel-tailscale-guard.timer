@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically verify the Sentinel and Tailscale boundary
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+RandomizedDelaySec=10s
+Unit=sentinel-tailscale-guard.service
+
+[Install]
+WantedBy=timers.target

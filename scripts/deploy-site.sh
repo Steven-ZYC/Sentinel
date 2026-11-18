@@ -10,9 +10,13 @@ fi
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(dirname -- "$SCRIPT_DIR")
 SOURCE_DIR="$PROJECT_DIR/site"
-TARGET_DIR=/data/safeline/resources/nginx/static/static_1
+SAFELINE_DIR=${SAFELINE_DIR:-/data/safeline}
+TARGET_DIR=${SAFELINE_STATIC_DIR:-$SAFELINE_DIR/resources/nginx/static/static_1}
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
-BACKUP="$TARGET_DIR/index.html.pre-split-$TIMESTAMP"
+BACKUP_ROOT=${SENTINEL_SITE_BACKUP_DIR:-$SAFELINE_DIR/backups/sentinel/site}
+BACKUP_DIR=$(python3 "$SCRIPT_DIR/harden_deployment.py" backups --webroot "$TARGET_DIR" --backup-root "$BACKUP_ROOT" | sed -n 's/^OK: legacy public backups moved to recoverable private directory: //p')
+[ -d "$BACKUP_DIR" ] || { echo 'error: private backup directory unavailable' >&2; exit 1; }
+BACKUP="$BACKUP_DIR/index.html.pre-split-$TIMESTAMP"
 
 for file in index.html styles.css app.js; do
     if [ ! -f "$SOURCE_DIR/$file" ]; then
@@ -31,7 +35,7 @@ if grep -Eq '<style([[:space:]>])|<script([[:space:]]*>)' "$SOURCE_DIR/index.htm
     exit 1
 fi
 
-install -o root -g root -m 0644 "$TARGET_DIR/index.html" "$BACKUP"
+install -o root -g root -m 0600 "$TARGET_DIR/index.html" "$BACKUP"
 
 CSS_TMP=$(mktemp "$TARGET_DIR/.styles.css.XXXXXX")
 JS_TMP=$(mktemp "$TARGET_DIR/.app.js.XXXXXX")

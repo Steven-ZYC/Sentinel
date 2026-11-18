@@ -1,0 +1,14 @@
+[Unit]
+Description=Bounded reconciliation of the approved private Tailscale Serve route
+After=tailscaled.service network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sentinel/guard.env
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/libexec/sentinel/tailscale-sentinel-guard ensure
+TimeoutStartSec=120
+RuntimeDirectory=sentinel
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077

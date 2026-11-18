@@ -10,6 +10,8 @@ Sentinel 是部署在 [SafeLine CE（雷池社区版）](https://waf-ce.chaitin.
 
 它不是 SafeLine 的分支、插件或替代品，也不会修改 SafeLine 镜像、二进制或控制台生成逻辑。
 
+重启/网络更新后的监听隔离、端口归属检查和可选自动恢复见[运行恢复机制](docs/runtime-recovery.md)。
+
 ## 工作链路
 
 ```text
@@ -17,11 +19,11 @@ Sentinel 是部署在 [SafeLine CE（雷池社区版）](https://waf-ce.chaitin.
 访客
   │ HTTPS
   ▼
-Cloudflare（DNS / CDN / DDoS 防护）
-  │ 仅受信 Cloudflare 网段可到达源站 80/443
+普通 DNS 直连，或 Cloudflare / 其他可信 HTTP 代理
+  │ direct 接受直接连接；代理模式只接受明确的代理网段
   ▼
 Sentinel（宿主机公网 IP :80/:443）
-  │ 还原 CF-Connecting-IP，TLS、Host 路由、安全头
+  │ 按 EDGE_MODE 识别来源 IP，TLS、Host 路由、安全头
   ├───────────────┬───────────────────────┐
   ▼               ▼                       ▼
 SafeLine       SafeLine                SafeLine
@@ -35,7 +37,7 @@ SafeLine       SafeLine                SafeLine
 SafeLine 管理面与业务数据面分离：
 
 ```text
-管理员 → Cloudflare Access + Tunnel 或 Tailscale Serve
+管理员 → SSH 本地端口转发、VPN、Access + Tunnel 或 Tailscale Serve
        → SafeLine 127.0.0.1:9443
 ```
 
@@ -47,8 +49,9 @@ SafeLine 管理面与业务数据面分离：
 
 | 端口/地址 | 所属层 | 可达范围 | 用途 |
 | --- | --- | --- | --- |
-| `<公网 IPv4>:80` | Sentinel | 仅 Cloudflare 网段 | HTTP，重定向至 HTTPS |
-| `<公网 IPv4>:443` | Sentinel | 仅 Cloudflare 网段 | 所有业务域名的 TLS 入口 |
+| `<本机入口 IP>:80` | Sentinel | direct 公网；代理模式仅可信网段 | HTTP，重定向至 HTTPS |
+| `<本机入口 IP>:443` | Sentinel | direct 公网；代理模式仅可信网段 | 所有业务域名的 TLS 入口 |
+| `127.0.0.1:18090`（可配） | Sentinel | 仅本机 | 无 DNS / TLS 依赖的健康检查 |
 | `127.0.0.1:10443`、`10444`… | SafeLine | 仅本机 | Sentinel 到各业务站点的 WAF listener |
 | 应用端口 | 应用 | 回环或私网 | 仅由 SafeLine 访问 |
 | `127.0.0.1:9443` | SafeLine 管理面 | Tunnel/Tailscale/本机 | 管理控制台，不是业务上游 |
@@ -57,12 +60,47 @@ SafeLine 管理面与业务数据面分离：
 
 ## 快速开始
 
+### 新服务器一行安装
+
+适用于已有 SafeLine CE 的 Linux 服务器。准备好 Git、Bash、Python 3.10+、OpenSSL、iproute2、rootful Docker 和 Compose v2。在雷池中建好业务域名及 HTTP 回环 listener，配置来源头 `X-Real-IP` 和下文的 real-IP include。将域名证书和私钥放在 root 管理的专用目录，保留独立 SSH 管理通道。入口 IP 的 80/443 须可供 Sentinel 使用。
+
+从包含本安装器的 GitHub 发布提交复制完整的 40 位 SHA，在 Bash 运行下面一行并按提示粘贴。命令下载仓库，检出指定版本，从 root 管理的全新目录运行安装向导。先确认该提交来自你审核过的版本。
+
+```bash
+read -rp '发布提交 SHA（40 位）: ' rev && [[ $rev =~ ^[0-9a-f]{40}$ ]] && sudo mkdir -m 0755 /opt/sentinel && sudo git clone --no-checkout https://github.com/Steven-ZYC/Sentinel.git /opt/sentinel && sudo git -C /opt/sentinel checkout --detach "$rev" && sudo /opt/sentinel/sentinel install
+```
+
+向导收集入口地址、域名、证书路径和雷池端口，写入权限为 `0600` 的配置。它会先核对管理面、上游 socket 归属、证书及候选 NGINX 配置，再提示输入 `deploy` 发布。复用已有完整配置或修正预检错误后，运行 `sudo /opt/sentinel/sentinel install`。已启用 Tailscale 管理转发时给安装命令加 `--tailscale`。雷池业务容器名称不同于 `safeline-tengine` 时，在 `.env` 设置 `SAFELINE_CONTAINER` 后重试。
+
+生产用的代码、Compose 文件、配置和父目录须由受信管理员控制。旧部署若位于普通用户可写的工作区，请在维护窗口迁移到受保护的目录，并核对旧容器归属和回退路径。从新目录运行 CLI 会拒绝接管另一目录的同名容器。
+
+| 业务请求从哪里到达 | 向导中填写 | 站点配置 |
+| --- | --- | --- |
+| Cloudflare 橙云 | `cloudflare` | 使用 Full (strict)，源站按 Cloudflare CIDR 放行 |
+| 企业自有 DNS、内网分域解析、Cloudflare 灰云 | `direct` | A/AAAA 指向对应入口，客户端信任站点证书 |
+| 企业负载均衡或其他 CDN | `trusted-proxy` | 输入受控代理的 CIDR 和它维护的来源头 |
+
+安装使用服务器已有的 DNS 解析设置。向导按流量路径选择信任策略，所有模式均无需 DNS API 凭据。旧版配置缺少 `EDGE_MODE` 时，发布会停止，须先按上表明确选择。启用 AAAA 前须配置本机入口 IPv6。使用企业 CA 时，给访问端配置信任链，验收可传 `--ca-file`。
+
+同一实例可接入由不同 DNS 服务商解析的域名，所有站点共用一个入口信任模式。例如，两家 DNS 服务商都把业务域名解析到服务器时可共用 `direct`；同时承载仅限橙云的站点和允许公网直连的站点，需要独立入口策略，当前向导仅配置单一模式。
+
+```bash
+cd /opt/sentinel
+sudo ./sentinel check                     # 校验候选配置
+sudo ./sentinel deploy                    # 发布修改并核对运行摘要
+sudo ./sentinel status                    # 核对运行版本、TLS、端口与归属，退出码表示结果
+./sentinel verify https://app.example.com # 验收访客实际经过的 HTTPS 链路
+```
+
+默认使用 2 个 NGINX worker，容器内存上限 512 MiB，请求与响应临时缓冲共用 128 MiB 的 cache tmpfs，容器日志轮转保留 3 个 10 MiB 文件。大文件、慢客户端或高并发可能耗尽缓冲并产生请求错误。按实际流量在 `.env` 调整 `SENTINEL_MEMORY_LIMIT` 和 `SENTINEL_CACHE_SIZE`，为同机雷池保留余量后重新发布。可选的防火墙和恢复 timer 见[通用服务器部署](docs/general-server-deployment.md)。
+
 ### 前提
 
 - Docker Engine 与 Docker Compose v2；运行账户需要访问 Docker。
 - Python 3.10+（只使用标准库，无 `pip` 依赖）。
 - 已部署 SafeLine CE，且每个业务站点能在控制台配置独立 HTTP listener。
-- Cloudflare 已为业务域名启用代理（橙云）和 `Full (strict)`；证书覆盖每一个域名。
+- 任意 DNS 服务商均可：普通 A/AAAA 直连使用 `EDGE_MODE=direct`，证书必须由客户端信任的 CA 签发并覆盖每个域名。Cloudflare、Tailscale 均非必需。
+- 仅在使用 Cloudflare 橙云时选择 `EDGE_MODE=cloudflare`，并配置 `Full (strict)`；其他 CDN/负载均衡使用 `trusted-proxy` 和明确的代理 CIDR。参见[通用服务器部署](docs/general-server-deployment.md)。
 - 服务器仍有 SSH 或云控制台等独立管理通道。
 
 ### 1. 创建全局环境和站点清单
@@ -79,6 +117,8 @@ chmod 600 .env sites.json
 ```dotenv
 # Sentinel 只绑定这一个公网 IPv4；不要填写 0.0.0.0。
 PUBLIC_LISTEN_ADDR=203.0.113.10
+EDGE_MODE=direct
+HEALTHCHECK_PORT=18090
 
 # 此宿主机目录会只读挂载为容器内 /etc/sentinel/tls。
 # sites.json 中的每个 certificate/private_key 必须位于该目录下。
@@ -137,14 +177,14 @@ DEFAULT_TLS_KEY_PATH=/etc/sentinel/tls/app.example.com/privkey.pem
 ### 3. 生成与预检
 
 ```bash
-./scripts/render-sites.py
-./scripts/preflight.sh
+sudo python3 scripts/harden_deployment.py tls
+sudo ./scripts/preflight.sh
 ```
 
-渲染器将配置写入本地、被 Git 忽略的 `nginx/generated/`。预检会确认：
+预检在 `nginx/generated/.revisions/` 暂存完整候选配置，不切换正在运行的版本。它会确认：
 
 - 清单字段、域名、端口、回环上游与生成文件有效；
-- 所有证书与私钥可读，且证书至少还有七天有效期；
+- 私钥 root:root `0600`、证书目录 `0750`；证书覆盖站点、匹配私钥且至少还有七天有效期；
 - 每个 SafeLine listener 都实际存在且**只监听** `127.0.0.1:<port>`；
 - Docker Compose 和生成后的 NGINX 配置均可通过语法检查。
 
@@ -153,7 +193,7 @@ DEFAULT_TLS_KEY_PATH=/etc/sentinel/tls/app.example.com/privkey.pem
 ### 4. 启动或更新 Sentinel
 
 ```bash
-sudo docker compose up -d
+sudo ./scripts/deploy-proxy.sh
 sudo docker compose ps
 sudo docker compose logs --tail=100 proxy
 ./scripts/verify.sh https://app.example.com
@@ -162,12 +202,13 @@ sudo docker compose logs --tail=100 proxy
 修改 `sites.json`、证书路径或 `.env` 后，始终重新运行：
 
 ```bash
-./scripts/render-sites.py
-./scripts/preflight.sh
-sudo docker compose up -d
+sudo ./scripts/preflight.sh
+sudo ./scripts/deploy-proxy.sh
 ```
 
-渲染器生成一个 TLS 默认虚拟主机，未知 `Host` 返回 `421`，不会被错误发送到第一个业务上游。
+发布脚本先验证完整候选，再原子切换 `current`，显式重建/重载并核对运行配置摘要；失败恢复上一版本及镜像。重建可能短暂中断流量，请安排维护窗口。`docker compose up -d` 单独执行不保证站点配置生效。离线调用渲染器不会重载线上 NGINX。
+
+渲染器生成一个 TLS 默认虚拟主机，未知 `Host` 返回 `421`（代理模式下不可信对端先返回 `403`），不会被错误发送到第一个业务上游。
 
 ## 给新业务站点分配端口
 
@@ -187,13 +228,12 @@ sudo docker compose up -d
    正确结果必须是 `127.0.0.1:10446`，而不是 `0.0.0.0:10446`。SafeLine 控制台重新发布站点或升级后可能重建其 NGINX 文件；每次都重新执行 `check`。
 
 4. 将新对象加入 `sites.json`，并填写该域名自己的证书路径和 `127.0.0.1:10446` 上游。
-5. 在 Cloudflare 创建橙云 DNS 记录，确认 Origin 证书覆盖该 hostname。
+5. 在所选 DNS 服务商创建 A/AAAA 记录，确认实际代理模式和证书。直连不要使用 Cloudflare Origin CA 证书。
 6. 渲染、预检并更新 Sentinel：
 
    ```bash
-   ./scripts/render-sites.py
-   ./scripts/preflight.sh
-   sudo docker compose up -d
+   sudo ./scripts/preflight.sh
+   sudo ./scripts/deploy-proxy.sh
    ./scripts/verify.sh https://new.example.com
    ```
 
@@ -203,7 +243,7 @@ sudo docker compose up -d
 
 ### 客户端 IP
 
-Sentinel 仅信任 `nginx/cloudflare-realip.conf` 中的 Cloudflare 官方 CIDR，从 `CF-Connecting-IP` 恢复真实客户端 IP。随后它覆盖外部传入的代理头，只向仅限回环的 SafeLine 发送单值 `X-Real-IP` / `X-Forwarded-For`。
+`direct` 使用连接来源 IP，忽略客户端伪造的代理头；`cloudflare` 信任官方 CIDR 的 `CF-Connecting-IP`；`trusted-proxy` 仅信任显式 CIDR 与指定头。代理模式还基于原始 TCP 对端执行 NGINX 来源 ACL。三种模式都重建单值 `X-Real-IP` / `X-Forwarded-For`，删除其他来源头。
 
 SafeLine 侧必须加载 [safeline/sentinel-realip.conf](safeline/sentinel-realip.conf)，并在控制台选择“从 HTTP Header 获取”、Header 为 `X-Real-IP`。不要信任任意来源的 `CF-Connecting-IP`，不要选择 PROXY Protocol，也不要使用 `set_real_ip_from 0.0.0.0/0` 或 `::/0`。
 
@@ -211,9 +251,9 @@ SafeLine 侧必须加载 [safeline/sentinel-realip.conf](safeline/sentinel-reali
 
 ### 网络与管理面
 
-- 主机与云防火墙只允许 Cloudflare 官方网段访问公网 `80/443`。
+- 主机与云防火墙按模式放行公网 `80/443`；`scripts/apply-network-boundary.sh plan` 先审阅方案，配置实际 `PUBLIC_INTERFACE` 后才 `apply`。不清空现有规则，不依赖固定网卡名。
 - 所有 SafeLine 业务 listener 必须为 `127.0.0.1:<port>`；应用端口同样应在回环或私网。
-- 管理端 `9443` 应通过 Cloudflare Tunnel + Access 或 Tailscale Serve 访问，而非公开暴露。参见 [Tunnel 指南](docs/cloudflare-tunnel-access.md) 和 [Tailscale 指南](docs/tailscale-management.md)。
+- 管理端 `9443` 仅回环，通过 SSH 隧道或 VPN 访问；Cloudflare Tunnel + Access 或 Tailscale Serve 为可选方案。参见 [通用部署](docs/general-server-deployment.md)、[Tunnel 指南](docs/cloudflare-tunnel-access.md) 和 [Tailscale 指南](docs/tailscale-management.md)。
 - 当前服务器若发现 `10445` 或 `9443` 仍绑定 `0.0.0.0` / `[::]`，这不是 Sentinel 可接受的最终边界；请在独立变更窗口使用对应文档收口。本项目不会在 `docker compose up` 时自动修改它们。
 
 ## 从旧版单站点配置迁移
@@ -227,8 +267,8 @@ SafeLine 侧必须加载 [safeline/sentinel-realip.conf](safeline/sentinel-reali
 # 审阅 /tmp/sites.json 后：
 ./scripts/migrate-legacy-env.py --write \
   --redirect legacy.example.com=https://app.example.com
-./scripts/render-sites.py
-./scripts/preflight.sh
+sudo ./scripts/preflight.sh
+sudo ./scripts/deploy-proxy.sh
 ```
 
 迁移期内，渲染器会临时接受旧的 `TLS_CERT_PATH` / `TLS_KEY_PATH` 作为默认 TLS 证书来源；仍需在 `.env` 设置包含这些文件的 `TLS_MOUNT_ROOT`。完成验证后应改为 `DEFAULT_TLS_CERT_PATH` / `DEFAULT_TLS_KEY_PATH`。旧业务变量不再被 Compose 使用，应在确认新入口正常后从 `.env` 删除。
@@ -245,7 +285,7 @@ SafeLine 侧必须加载 [safeline/sentinel-realip.conf](safeline/sentinel-reali
 4. SafeLine 控制台和应用日志看到正确、不可伪造的客户端 IP；
 5. 对应域名命中自己的 SafeLine 规则和应用上游；
 6. 登录、上传、API、WebSocket、错误页与 CSP 均经回归验证；
-7. 对公网无法连接任何 `104xx` SafeLine listener，也无法绕过 Cloudflare/Sentinel 直达业务。
+7. 对公网无法连接任何 SafeLine 内部 listener；代理模式不能绕过所选可信代理，所有模式都不能绕过 Sentinel/WAF。
 
 `scripts/verify.sh https://<domain>` 提供 TLS、安全头和 TRACE 的基础检查；完整安全扫描验收见 [Acunetix 验收标准](docs/acunetix-acceptance.md)。
 
@@ -253,7 +293,7 @@ SafeLine 侧必须加载 [safeline/sentinel-realip.conf](safeline/sentinel-reali
 
 **`generated NGINX configuration is out of date`**
 
-运行 `./scripts/render-sites.py`。生成文件不是手写配置，修改 `sites.json` 后必须重新生成。
+运行 `sudo ./scripts/deploy-proxy.sh`。生成文件不是手写配置；修改清单后必须验证、发布并核对运行版本。
 
 **预检提示 SafeLine listener 不是 loopback-only**
 

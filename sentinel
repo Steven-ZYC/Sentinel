@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+
+case "${1:-help}" in
+  install)
+    shift
+    [[ $EUID == 0 ]] || { echo '请用 sudo 运行安装。' >&2; exit 1; }
+    case "${1:-}" in
+      '') management=management ;;
+      --tailscale) management=management-tailnet; shift ;;
+      *) echo 'usage: sentinel install [--tailscale]' >&2; exit 2 ;;
+    esac
+    [[ $# == 0 ]] || exit 2
+    docker compose version
+    python3 scripts/security_checks.py "$management"
+    python3 scripts/configure.py
+    bash scripts/preflight.sh
+    read -r -p '发布将重建 Sentinel，可能短暂中断业务。输入 deploy 继续：' answer
+    [[ $answer == deploy ]] || { echo '已取消发布，配置可供下次使用。'; exit 1; }
+    exec bash scripts/deploy-proxy.sh
+    ;;
+  check|deploy|status)
+    [[ $# == 1 ]] || exit 2
+    case "$1" in
+      check) exec bash scripts/preflight.sh ;;
+      deploy) exec bash scripts/deploy-proxy.sh ;;
+      status) exec python3 scripts/runtime_guard.py check-public ;;
+    esac
+    ;;
+  verify) shift; exec bash scripts/verify.sh "$@" ;;
+  help|--help|-h) echo 'sentinel install [--tailscale] | check | deploy | status | verify https://domain [--ca-file file]' ;;
+  *) echo '未知操作。请运行 sentinel help。' >&2; exit 2 ;;
+esac

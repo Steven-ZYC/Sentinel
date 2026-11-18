@@ -10,10 +10,13 @@ data must be declarative, and rendering it must never execute user input.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import ipaddress
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -27,6 +30,7 @@ DEFAULT_SITES_FILE = PROJECT_DIR / "sites.json"
 DEFAULT_ENV_FILE = PROJECT_DIR / ".env"
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "nginx" / "generated"
 CONTAINER_TLS_ROOT = "/etc/sentinel/tls"
+GENERATED_FILE_MODE = 0o644
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 SIZE_RE = re.compile(r"^(?:0|[1-9][0-9]*[kKmMgG]?)$")
@@ -103,7 +107,7 @@ def normalize_domain(value: Any, field: str) -> str:
 
 def absolute_path(value: Any, field: str) -> str:
     path = require_string(value, field)
-    reject_control_characters(path, field)
+    reject_control_characters(path, field, reject_dollar=True)
     if not Path(path).is_absolute():
         fail(f"{field} must be an absolute path")
     return path
@@ -146,6 +150,73 @@ def parse_public_address(env: dict[str, str]) -> str:
     if parsed.is_unspecified or parsed.is_loopback or parsed.is_multicast:
         fail("PUBLIC_LISTEN_ADDR must not be wildcard, loopback, or multicast")
     return str(parsed)
+
+
+def public_addresses(env: dict[str, str]) -> list[str]:
+    addresses = [parse_public_address(env)]
+    if env.get("PUBLIC_LISTEN_IPV6"):
+        try:
+            address = ipaddress.IPv6Address(env["PUBLIC_LISTEN_IPV6"])
+        except ValueError as error:
+            fail(f"PUBLIC_LISTEN_IPV6 must be an explicit IPv6 address: {error}")
+        if address.is_unspecified or address.is_loopback or address.is_multicast or address.ipv4_mapped or address.scope_id:
+            fail("PUBLIC_LISTEN_IPV6 must not be wildcard, loopback, scoped, or IPv4-mapped")
+        addresses.append(f"[{address}]")
+    return addresses
+
+
+def edge_policy(env: dict[str, str]) -> tuple[str, list[str], str]:
+    mode = env.get("EDGE_MODE")
+    if mode not in ("direct", "cloudflare", "trusted-proxy"):
+        fail("EDGE_MODE must be direct, cloudflare, or trusted-proxy")
+    if mode == "direct":
+        if env.get("TRUSTED_PROXY_CIDRS"):
+            fail("TRUSTED_PROXY_CIDRS requires EDGE_MODE=trusted-proxy")
+        return mode, [], ""
+    if mode == "cloudflare":
+        source = (PROJECT_DIR / "nginx/cloudflare-realip.conf").read_text(encoding="utf-8")
+        cidrs = re.findall(r"^set_real_ip_from\s+([^;]+);\s*$", source, re.M)
+        if len(cidrs) < 20:
+            fail("bundled Cloudflare trust list is unexpectedly short")
+        header = "CF-Connecting-IP"
+    else:
+        cidrs = require_string(env.get("TRUSTED_PROXY_CIDRS"), "TRUSTED_PROXY_CIDRS").split(",")
+        header = env.get("REAL_IP_HEADER", "X-Forwarded-For")
+        if header not in ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"):
+            fail("REAL_IP_HEADER must be X-Forwarded-For, X-Real-IP, or CF-Connecting-IP")
+    networks = []
+    for cidr in cidrs:
+        try:
+            network = ipaddress.ip_network(cidr.strip(), strict=True)
+        except ValueError as error:
+            fail(f"invalid trusted proxy CIDR: {error}")
+        if network.prefixlen == 0 or network.is_multicast or network.is_unspecified:
+            fail("trusted proxy CIDRs must not trust all or multicast/unspecified networks")
+        networks.append(str(network))
+    return mode, sorted(set(networks)), header
+
+
+def healthcheck_port(env: dict[str, str], sites: list[Site]) -> int:
+    raw = env.get("HEALTHCHECK_PORT", "18090")
+    if not re.fullmatch(r"[0-9]{1,5}", raw):
+        fail("HEALTHCHECK_PORT must be an integer")
+    port = int(raw)
+    reserved = {80, 443, 9443} | {site.upstream_port for site in sites if isinstance(site, ProxySite)}
+    if not 1024 <= port <= 65535 or port in reserved:
+        fail("HEALTHCHECK_PORT must be an unprivileged port distinct from all service ports")
+    return port
+
+
+def render_edge(env: dict[str, str]) -> str:
+    mode, cidrs, header = edge_policy(env)
+    lines = [f"# Generated edge policy: {mode}. DNS provider is independent."]
+    if cidrs:
+        lines.extend(f"set_real_ip_from {cidr};" for cidr in cidrs)
+        lines.extend((f"real_ip_header {header};", f"real_ip_recursive {'on' if header == 'X-Forwarded-For' else 'off'};"))
+    lines.extend(("geo $realip_remote_addr $sentinel_peer_allowed {", f"    default {'1' if mode == 'direct' else '0'};"))
+    lines.extend(f"    {cidr} 1;" for cidr in cidrs)
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 
 def parse_default_tls(env: dict[str, str]) -> Tls:
@@ -252,8 +323,8 @@ def parse_site(data: Any, index: int) -> Site:
     if address != "127.0.0.1":
         fail(f"{field}.upstream.address must be 127.0.0.1")
     port = upstream.get("port")
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
-        fail(f"{field}.upstream.port must be an integer between 1 and 65535")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+        fail(f"{field}.upstream.port must be an integer between 1024 and 65535")
     if port in (80, 443, 9443):
         fail(f"{field}.upstream.port must not use Sentinel or SafeLine management port {port}")
     if upstream.get("scheme") != "http":
@@ -416,8 +487,12 @@ server {{
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header CF-Connecting-IP "";
+        proxy_set_header CF-Connecting-IPv6 "";
+        proxy_set_header True-Client-IP "";
+        proxy_set_header Forwarded "";
         proxy_set_header X-Forwarded-Host $host;
         proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port 443;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_cookie_flags ~ secure httponly samesite=lax;
@@ -429,6 +504,10 @@ server {{
         proxy_hide_header X-Content-Type-Options;
         proxy_hide_header Referrer-Policy;
         proxy_hide_header Permissions-Policy;
+        proxy_hide_header Strict-Transport-Security;
+        proxy_hide_header Cross-Origin-Opener-Policy;
+        proxy_hide_header Cross-Origin-Resource-Policy;
+        proxy_hide_header X-Permitted-Cross-Domain-Policies;
     }}
 }}
 """
@@ -460,14 +539,51 @@ server {{
 """
 
 
-def rendered_files(address: str, mount_root: str, default_tls: Tls, sites: list[Site]) -> dict[str, str]:
-    files = {"00-default.conf": render_default(address, container_tls(default_tls, mount_root))}
+def rendered_files(address: str, mount_root: str, default_tls: Tls, sites: list[Site], env: dict[str, str] | None = None) -> dict[str, str]:
+    if env is None:
+        env = {"PUBLIC_LISTEN_ADDR": address, "EDGE_MODE": "direct"}
+    addresses = public_addresses(env)
+    port = healthcheck_port(env, sites)
+    files = {"00-edge.conf": render_edge(env), "02-default.conf": render_default(address, container_tls(default_tls, mount_root))}
+    files["01-healthcheck.conf"] = f'''# Generated loopback-only liveness endpoint; no DNS, TLS or CDN dependency.
+server {{
+    listen 127.0.0.1:{port};
+    server_name localhost;
+    add_header X-Sentinel-Config "__SENTINEL_CONFIG_DIGEST__" always;
+    location = /.sentinel/health {{ access_log off; default_type text/plain; return 200 "ok\\n"; }}
+    location / {{ return 404; }}
+}}
+'''
     for index, site in enumerate(sites, start=10):
         filename = f"{index:02d}-{site.name}.conf"
         tls = container_tls(site.tls, mount_root)
         files[filename] = render_proxy(address, site, tls) if isinstance(site, ProxySite) else render_redirect(address, site, tls)
     health_site = next(site for site in sites if isinstance(site, ProxySite))
     files[".healthcheck-host"] = f"{health_site.domain}\n"
+    files[".healthcheck-port"] = f"{port}\n"
+    files[".public-listen-addresses"] = "".join(f"{ip.strip('[]')}\n" for ip in addresses)
+    from listener_boundary import configured_tailnet_interface
+    files[".tailscale-interface"] = configured_tailnet_interface(env) + "\n"
+    bootstrap = (PROJECT_DIR / "nginx/nginx.conf").read_text()
+    files[".bootstrap-sha256"] = hashlib.sha256(bootstrap.encode()).hexdigest() + "\n"
+    for name, content in list(files.items()):
+        if name == "02-default.conf" or (name.endswith(".conf") and name not in ("00-edge.conf", "01-healthcheck.conf")):
+            # Every public vhost enforces peer ACLs, independently of host firewall rules.
+            content = content.replace("    server_name ", "    if ($sentinel_peer_allowed = 0) { return 403; }\n    server_name ")
+            if len(addresses) > 1:
+                content = re.sub(rf"    listen {re.escape(address)}:(80|443)([^;]*);", lambda match: match[0] + f"\n    listen {addresses[1]}:{match[1]}{match[2]};", content)
+            files[name] = content
+    from listener_boundary import validate_configuration
+    validate_configuration(bootstrap, files, addresses, port)
+    digest = hashlib.sha256("".join(f"{name}\n{files[name]}" for name in sorted(files)).encode()).hexdigest()
+    files["01-healthcheck.conf"] = files["01-healthcheck.conf"].replace("__SENTINEL_CONFIG_DIGEST__", digest)
+    files[".config-digest"] = digest + "\n"
+    startup_checksums = files[".bootstrap-sha256"].strip() + "  /etc/nginx/nginx.conf\n"
+    startup_checksums += "".join(
+        f"{hashlib.sha256(content.encode()).hexdigest()}  /etc/nginx/conf.d/current/{name}\n"
+        for name, content in sorted(files.items())
+    )
+    files[".startup-checksums"] = startup_checksums
     return files
 
 
@@ -475,6 +591,8 @@ def validate_certificates(mount_root: str, default_tls: Tls, sites: list[Site]) 
     root = Path(mount_root)
     if not root.is_dir() or not os.access(root, os.R_OK | os.X_OK):
         fail(f"TLS_MOUNT_ROOT is not a readable directory: {root}")
+    if root.stat().st_mode & 0o022:
+        fail(f"TLS_MOUNT_ROOT must not be group/world-writable: {root}")
     checked: set[tuple[str, str]] = set()
     for label, tls in [("default TLS", default_tls)] + [(site.domain, site.tls) for site in sites]:
         pair = (tls.certificate, tls.private_key)
@@ -483,28 +601,71 @@ def validate_certificates(mount_root: str, default_tls: Tls, sites: list[Site]) 
         checked.add(pair)
         for kind, value in (("certificate", tls.certificate), ("private key", tls.private_key)):
             path = Path(value)
+            container_tls(tls, mount_root)
             if not path.is_file() or not os.access(path, os.R_OK):
                 fail(f"{label} {kind} is not a readable regular file: {path}")
+            if kind == "private key" and path.stat().st_mode & 0o077:
+                fail(f"{label} private key must have mode 0600 (or stricter): {path}")
+            parent = path.resolve().parent
+            while True:
+                if parent.stat().st_mode & 0o022:
+                    fail(f"TLS path has a group/world-writable parent: {parent}")
+                if parent == root.resolve():
+                    break
+                parent = parent.parent
+
+
+def activate_revision(output: Path, revision: Path) -> None:
+    relative = revision.resolve().relative_to((output / ".revisions").resolve())
+    if len(relative.parts) != 1 or not revision.is_dir():
+        fail("revision must be a direct child of the generated .revisions directory")
+    temporary = output / f".current-{os.getpid()}"
+    try:
+        temporary.symlink_to(Path(".revisions") / relative)
+        os.replace(temporary, output / "current")
+        descriptor = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def stage_rendered_files(output: Path, files: dict[str, str]) -> Path:
+    output.mkdir(parents=True, exist_ok=True)
+    revisions = output / ".revisions"
+    revisions.mkdir(mode=0o755, exist_ok=True)
+    revision = Path(tempfile.mkdtemp(prefix="rev-", dir=revisions))
+    try:
+        revision.chmod(0o755)
+        for name, content in files.items():
+            with (revision / name).open("x", encoding="utf-8") as temporary:
+                temporary.write(content)
+                temporary.flush()
+                os.fchmod(temporary.fileno(), GENERATED_FILE_MODE)
+                os.fsync(temporary.fileno())
+        for directory in (revision, revisions):
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    except BaseException:
+        shutil.rmtree(revision)  # Only this function's newly-created staging directory.
+        raise
+    return revision
 
 
 def write_rendered_files(output: Path, files: dict[str, str]) -> None:
     output.mkdir(parents=True, exist_ok=True)
-    expected = set(files)
-    for path in output.iterdir():
-        if path.name == ".gitkeep":
-            continue
-        if path.name in expected or path.suffix == ".conf" or path.name == ".healthcheck-host":
-            path.unlink()
-    for name, content in files.items():
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output, delete=False) as temporary:
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
-        os.replace(temporary_path, output / name)
+    with (output / ".publish.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        activate_revision(output, stage_rendered_files(output, files))
 
 
 def check_rendered_files(output: Path, files: dict[str, str]) -> None:
+    output = output / "current"
     stale = [name for name, content in files.items() if not (output / name).is_file() or (output / name).read_text(encoding="utf-8") != content]
     unexpected = [
         path.name
@@ -529,13 +690,16 @@ def main() -> int:
     parser.add_argument("--check-certificates", action="store_true", help="require every certificate and key path to be readable")
     parser.add_argument("--list-upstreams", action="store_true", help="print proxy domain, address, and port as tab-separated rows")
     parser.add_argument("--list-certificates", action="store_true", help="print certificate/key paths as tab-separated rows")
+    parser.add_argument("--stage", action="store_true", help="write a complete revision without activating it; print its path")
+    parser.add_argument("--activate", type=Path, help="atomically activate an existing staged revision")
     arguments = parser.parse_args()
-    if sum((arguments.check, arguments.list_upstreams, arguments.list_certificates)) > 1:
+    if sum((arguments.check, arguments.list_upstreams, arguments.list_certificates, arguments.stage, bool(arguments.activate))) > 1:
         parser.error("--check, --list-upstreams, and --list-certificates are mutually exclusive")
 
     try:
         env = parse_env(arguments.env)
-        address = parse_public_address(env)
+        address = public_addresses(env)[0]
+        edge_policy(env)
         tls_mount_root = parse_tls_mount_root(env)
         default_tls = parse_default_tls(env)
         sites = load_sites(arguments.sites)
@@ -556,12 +720,18 @@ def main() -> int:
                     print(f"{tls.certificate}\t{tls.private_key}")
             return 0
 
-        files = rendered_files(address, tls_mount_root, default_tls, sites)
+        files = rendered_files(address, tls_mount_root, default_tls, sites, env)
         if arguments.check:
             check_rendered_files(arguments.output, files)
+        elif arguments.stage:
+            print(stage_rendered_files(arguments.output, files))
+        elif arguments.activate:
+            with (arguments.output / ".publish.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                activate_revision(arguments.output, arguments.activate)
         else:
             write_rendered_files(arguments.output, files)
-    except ConfigError as error:
+    except (ConfigError, OSError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     return 0

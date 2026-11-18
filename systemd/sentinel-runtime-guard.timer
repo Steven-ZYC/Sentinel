@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile Sentinel after boot, Docker upgrades and transient network changes
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+RandomizedDelaySec=10s
+Unit=sentinel-runtime-guard.service
+
+[Install]
+WantedBy=timers.target

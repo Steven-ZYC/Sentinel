@@ -74,7 +74,7 @@ proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 
 ## 当前实现的目标信任链
 
-当前仓库已在 `nginx/nginx.conf` 加载 `nginx/cloudflare-realip.conf`，且由站点清单生成的 proxy 配置会重建 `X-Real-IP` / `X-Forwarded-For`。以下链路在源站防火墙和 SafeLine 回环信任配置同时完成后成立：
+当前通过 `EDGE_MODE` 生成 `current/00-edge.conf`：direct 不信任来源头，cloudflare 使用官方 CIDR，trusted-proxy 使用显式代理 CIDR。所有模式都会重建 `X-Real-IP` / `X-Forwarded-For` 并删除其他来源头。下面以 Cloudflare 模式说明；NGINX 自身以原始 TCP 对端限制可信代理，主机/云防火墙提供额外防护，SafeLine 还必须配置回环信任。普通 DNS 直连及其他代理见[通用服务器部署](general-server-deployment.md)。
 
 ```text
 访客 IP
@@ -181,47 +181,36 @@ Cloudflare 官方网段后使用；本架构由 Sentinel 把结果转换成 `X-R
   `CF-Connecting-IP` 恢复 Sentinel 的 `$remote_addr`。
 - `safeline/sentinel-realip.conf`：SafeLine 只信任回环地址上的 Sentinel，并从
   Sentinel 生成的 `X-Real-IP` 恢复来源。
-- `scripts/apply-network-boundary.sh`：部署 real-IP 配置、将 SafeLine 管理端绑定到
-  回环地址并重建最小 UFW 边界。
+- `scripts/harden-deployment.sh`：收紧 TLS 与业务监听，安装 real-IP、移动公开备份并安全发布；Tailscale 管理保护是可选项。
+- `scripts/apply-network-boundary.sh`：按入口模式和实际公网网卡规划/插入 UFW 规则，不清空现有规则或改变管理方式。
 
 部署后的端口边界为：
 
 | 端口 | 允许来源 | 用途 |
 | --- | --- | --- |
-| 80/443 | Cloudflare 官方 IPv4/IPv6 网段 | 公网站点 |
-| 22 | `tailscale0` | SSH 管理 |
+| 80/443 | direct 直连；代理模式为已声明可信网段 | 公网站点 |
+| SSH 端口 | 现有经过审核的管理规则 | SSH 管理，非必须 Tailscale |
 | 9443 | `127.0.0.1` | SafeLine 管理平台 |
 | 10443、10444… | `127.0.0.1` | Sentinel 到每个 SafeLine 业务 listener |
-| UDP 41641 | 公网入站 | Tailscale 加密直连协商 |
+| 127.0.0.1:18090（可配） | 仅本机 | 独立健康检查 |
 
-脚本会替换现有 UFW 用户规则，不会保留未列出的历史开放端口。运行前它要求已有一条
-通过服务器 Tailscale 地址建立的 SSH 会话，并备份 `/etc/ufw` 和 SafeLine 配置。
-应用防火墙前会启动一个 3 分钟后的 systemd 自动回滚任务。
+在 `.env` 指定真实 `PUBLIC_INTERFACE`，先审阅计划。apply 仅在 UFW 已启用时执行，保留 SSH/其他规则，不假设网卡为 eth0，也不自动改变默认策略。无 UFW 的服务器应使用自己的 nftables/云安全组；管理修改之前始终保留独立 SSH/控制台和第二条会话。
 
 执行：
 
 ```bash
-cd /home/steven/project/Sentinel
-sudo ./scripts/apply-network-boundary.sh
+cd /path/to/Sentinel
+./scripts/apply-network-boundary.sh plan
+sudo ./scripts/apply-network-boundary.sh apply
 ```
 
-脚本提示后，必须从第二个终端验证新的 Tailscale SSH 会话。生产管理访问推荐先按
-[Cloudflare Tunnel + Access 管理指南](cloudflare-tunnel-access.md)建立受认证 hostname，
-然后执行：
-
-```bash
-sudo MANAGEMENT_URL=https://waf.example.com \
-  ./scripts/apply-network-boundary.sh
-```
-
-若尚未配置 Tunnel，只能将 SSH 隧道作为临时验收方式：
+管理访问可以使用 SSH 隧道、VPN，或可选的 [Cloudflare Tunnel + Access](cloudflare-tunnel-access.md)：
 
 ```bash
 ssh -N -L 9443:127.0.0.1:9443 <admin-user>@<management-ip>
 ```
 
-然后访问 `https://127.0.0.1:9443`。SSH 和管理平台均确认正常后，在原脚本终端输入
-大写 `CONFIRM`；否则不要确认，系统会自动恢复原来的 UFW 和管理端绑定。
+然后访问 `https://127.0.0.1:9443`。来源网段与管理规则修改后从第二个终端重新验证；防火墙辅助脚本不提供原来的全量规则替换/定时回滚模式，也不要求 Cloudflare/Tailscale。
 
 每次 Cloudflare 公布网段变更后，必须先更新 `nginx/cloudflare-realip.conf`，逐项与
 官方列表核对，再重新运行配置检查。遗漏新网段会导致对应 Cloudflare 节点无法访问

@@ -1,0 +1,21 @@
+[Unit]
+Description=Reassert Sentinel's private Tailscale Serve route
+Documentation=https://tailscale.com/docs/reference/tailscale-cli/serve
+Requires=tailscaled.service
+After=tailscaled.service
+PartOf=tailscaled.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sentinel/guard.env
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/libexec/sentinel/tailscale-sentinel-guard ensure
+RemainAfterExit=yes
+TimeoutStartSec=120
+RuntimeDirectory=sentinel
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+
+[Install]
+WantedBy=tailscaled.service

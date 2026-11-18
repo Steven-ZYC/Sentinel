@@ -1,0 +1,14 @@
+[Unit]
+Description=Bounded verification and recovery of the running Sentinel public proxy
+After=docker.service network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sentinel/runtime.env
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/libexec/sentinel/sentinel-runtime-guard reconcile-public
+TimeoutStartSec=120
+RuntimeDirectory=sentinel
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
